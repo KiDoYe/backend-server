@@ -9,7 +9,7 @@ import pymysql  # pip install pymysql --break-system-packages
 from dotenv import load_dotenv  # pip install python-dotenv --break-system-packages
 
 # =========================================================
-# DB 접속 정보 (.env 파일에서 불러옴 — 절대 코드에 직접 쓰지 않기)
+# DB / Discord 접속 정보 (.env 파일에서 불러옴 — 절대 코드에 직접 쓰지 않기)
 # =========================================================
 load_dotenv()
 
@@ -21,6 +21,8 @@ DB_CONFIG = {
     "database": os.getenv("DB_NAME", "apply_db"),
     "charset": "utf8mb4",
 }
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -143,21 +145,22 @@ def crawl_jobkorea(keyword, start_page=1, end_page=1):
 
 # =========================================================
 # 3. 데이터 저장 함수 (job 테이블에 직접 INSERT)
+#    반환값: (신규로 새로 추가된 공고 목록, 기존 공고 갱신 건수, 실패 건수)
 # =========================================================
 def save_to_mariadb(job_list):
     if not job_list:
         print("저장할 데이터가 없습니다.")
-        return
+        return [], 0, 0
 
     if not DB_CONFIG["user"] or not DB_CONFIG["password"]:
         print("[에러] DB_USER / DB_PASSWORD가 설정되지 않았습니다. .env 파일을 확인하세요.")
-        return
+        return [], 0, 0
 
     try:
         conn = pymysql.connect(**DB_CONFIG)
     except pymysql.MySQLError as e:
         print(f"DB 연결 에러: {e}")
-        return
+        return [], 0, 0
 
     # crawled_at은 DEFAULT current_timestamp(), apply는 DEFAULT 'PENDING'이라
     # 최초 INSERT 시에는 값을 넣지 않고 DB 기본값을 그대로 사용
@@ -174,7 +177,9 @@ def save_to_mariadb(job_list):
             crawled_at = CURRENT_TIMESTAMP
     """
 
-    inserted, skipped = 0, 0
+    new_jobs = []      # 이번에 처음 저장된(신규) 공고만 모아둠 -> 디스코드 알림용
+    updated, skipped = 0, 0
+
     with conn.cursor() as cursor:
         for job in job_list:
             try:
@@ -190,7 +195,14 @@ def save_to_mariadb(job_list):
                     job["end_at"],
                     job["job_url"]
                 ))
-                inserted += 1
+                # MySQL/MariaDB의 ON DUPLICATE KEY UPDATE 규칙:
+                #   신규 INSERT     -> rowcount == 1
+                #   기존 행 값 변경  -> rowcount == 2
+                #   기존 행 값 동일  -> rowcount == 0
+                if cursor.rowcount == 1:
+                    new_jobs.append(job)
+                elif cursor.rowcount == 2:
+                    updated += 1
             except pymysql.MySQLError as e:
                 print(f"INSERT 실패 (post_id={job.get('post_id')}): {e}")
                 skipped += 1
@@ -199,11 +211,52 @@ def save_to_mariadb(job_list):
     conn.commit()
     conn.close()
 
-    print(f"DB 저장 완료: 처리 {inserted}건 / 실패 {skipped}건")
+    print(f"DB 저장 완료: 신규 {len(new_jobs)}건 / 갱신 {updated}건 / 실패 {skipped}건")
+    return new_jobs, updated, skipped
 
 
 # =========================================================
-# 4. 실행부
+# 4. 디스코드 알림
+# =========================================================
+def notify_discord(new_jobs, updated, skipped, keyword):
+    """
+    크롤링 결과를 디스코드 웹훅으로 전송.
+    DISCORD_WEBHOOK_URL이 .env에 없으면 조용히 건너뜀 (알림 없이도 크롤링 자체는 정상 동작).
+    """
+    if not DISCORD_WEBHOOK_URL:
+        print("[안내] DISCORD_WEBHOOK_URL이 설정되지 않아 디스코드 알림을 건너뜁니다.")
+        return
+
+    total_new = len(new_jobs)
+
+    if total_new == 0:
+        content = f"🔍 **[{keyword}]** 크롤링 완료 — 신규 공고 없음 (갱신 {updated}건 / 실패 {skipped}건)"
+        payload = {"content": content}
+    else:
+        # 디스코드 메시지 길이 제한(2000자) 고려해서 최대 10건만 본문에 나열
+        lines = []
+        for job in new_jobs[:10]:
+            lines.append(f"• **{job['company_name']}** - [{job['post_title']}]({job['job_url']})")
+        more = f"\n…외 {total_new - 10}건" if total_new > 10 else ""
+
+        embed = {
+            "title": f"🆕 [{keyword}] 신규 채용공고 {total_new}건",
+            "description": "\n".join(lines) + more,
+            "color": 3447003,
+            "footer": {"text": f"갱신 {updated}건 / 실패 {skipped}건"},
+        }
+        payload = {"embeds": [embed]}
+
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        print("[디스코드] 알림 전송 완료")
+    except requests.RequestException as e:
+        print(f"[디스코드] 알림 전송 실패: {e}")
+
+
+# =========================================================
+# 5. 실행부
 # =========================================================
 def main():
     keyword = "파이썬 개발자"
@@ -214,11 +267,12 @@ def main():
 
     if not result:
         print("⚠️ 수집된 데이터가 없습니다. 사이트 구조가 바뀌었거나 크롤링이 차단됐을 수 있습니다.")
+        notify_discord([], 0, 0, keyword)
         return
 
-    save_to_mariadb(result)
+    new_jobs, updated, skipped = save_to_mariadb(result)
+    notify_discord(new_jobs, updated, skipped, keyword)
 
 
 if __name__ == "__main__":
     main()
-
